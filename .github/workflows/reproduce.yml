@@ -1,0 +1,75 @@
+# Copyright (c) Microsoft Corporation. All rights reserved.
+name: Demonstrate object loss and workaround
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce:
+    name: ${{ matrix.os }} / pinned vulnerable Git
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Git for Windows 2.55.0.windows.3
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'PortableGit.7z.exe'
+          $destination = Join-Path $env:RUNNER_TEMP 'repro-git'
+          Invoke-WebRequest 'https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.3/PortableGit-2.55.0.3-64-bit.7z.exe' -OutFile $archive
+          $expected = 'ab00566336b5472120f9a52d34f2e79c5406535792acb0548001ffd0bd090e5d'
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) {
+            throw 'Portable Git checksum mismatch'
+          }
+          7z x $archive "-o$destination" -y | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Portable Git extraction failed' }
+          "$destination\cmd" >> $env:GITHUB_PATH
+
+      - name: Build upstream Git 2.55.0
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth=1 --branch=v2.55.0 https://github.com/git/git.git "$RUNNER_TEMP/git-source"
+          make -C "$RUNNER_TEMP/git-source" -j2 \
+            prefix="$RUNNER_TEMP/repro-git" \
+            NO_GETTEXT=YesPlease NO_TCLTK=YesPlease NO_PERL=YesPlease \
+            all install >"$RUNNER_TEMP/git-build.log" 2>&1 || {
+              cat "$RUNNER_TEMP/git-build.log"
+              exit 1
+            }
+          echo "$RUNNER_TEMP/repro-git/bin" >> "$GITHUB_PATH"
+
+      - name: Verify pinned version and reproduce three times
+        shell: pwsh
+        run: |
+          $version = git --version
+          $expected = if ($IsWindows) { 'git version 2.55.0.windows.3' } else { 'git version 2.55.0' }
+          if ($version -ne $expected) { throw "Unexpected Git version: $version" }
+          python repro.py --repeat 3 --expect vulnerable
+          if ($LASTEXITCODE -ne 0) { throw 'Reproduction expectations failed' }
+
+      - name: Upload evidence (no repository pack data)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-${{ matrix.os }}
+          if-no-files-found: warn
+          path: |
+            artifacts/results.json
+            artifacts/summary.md
+            artifacts/**/*.log
