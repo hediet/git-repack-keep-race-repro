@@ -1,5 +1,7 @@
 # Git repack `.keep` race: deterministic object-loss reproduction
 
+[![Demonstrate object loss and workaround](https://github.com/hediet/git-repack-keep-race-repro/actions/workflows/reproduce.yml/badge.svg)](https://github.com/hediet/git-repack-keep-race-repro/actions/workflows/reproduce.yml)
+
 This repository demonstrates a race in **unmodified Git**: geometric repacking
 can delete a reachable commit and its tree when a duplicate pack reception
 creates a `.keep` file between two scans.
@@ -59,6 +61,9 @@ It does not mean the pinned Git versions are safe. CI tests
 Git for Windows **2.55.0.windows.3** and upstream Git **2.55.0**, three times each.
 Read the job summary or download the evidence artifact for the outcome table,
 object IDs, subprocess arguments, and logs.
+
+Both platforms reproduce the loss on clean GitHub-hosted runners, so this is not
+specific to Windows, to a filesystem, or to one machine's configuration.
 
 ## Why controlling timing is legitimate
 
