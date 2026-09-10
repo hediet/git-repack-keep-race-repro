@@ -98,6 +98,11 @@ CI builds two Git trees from source and runs the same harness against both:
 | `gitgitgadget/git` master, unpatched | must still lose objects |
 | `refs/pull/2219/head` (the proposed fix) | must preserve every object |
 
+Both expectations currently hold. With an identical injection on the same runner,
+unpatched master `b8242b0` ends at `fsck` exit 2 with the parent commit, tree and
+blob gone, while patched `a18e354` ends at `fsck` exit 0 with every object intact
+across all 27 cases — so **the proposed fix resolves exactly this failure**.
+
 This is what makes the badge meaningful: it fails if the bug stops reproducing on
 unpatched Git *or* if the proposed fix stops preventing it. The exact commits
 tested are printed in each run's job summary. Released builds are covered too —
