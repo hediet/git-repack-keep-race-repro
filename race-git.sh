@@ -1,5 +1,4 @@
 #!/bin/sh
-# Copyright (c) Microsoft Corporation. All rights reserved.
 
 set -eu
 

@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Microsoft Corporation. All rights reserved.
-
 """Reproduce a pack keep-file race using synthetic repositories only."""
 
 import argparse

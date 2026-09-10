@@ -2,43 +2,75 @@
 
 [![Demonstrate object loss and workaround](https://github.com/hediet/git-repack-keep-race-repro/actions/workflows/reproduce.yml/badge.svg)](https://github.com/hediet/git-repack-keep-race-repro/actions/workflows/reproduce.yml)
 
-This repository demonstrates a race in **unmodified Git**: geometric repacking
-can delete a reachable commit and its tree when a duplicate pack reception
-creates a `.keep` file between two scans.
+**Unmodified Git can delete a reachable commit.** If a fetch lands while
+`git repack --geometric` is running, repack can delete a pack whose objects the
+new pack deliberately left out. `repack` still exits `0`; the loss only shows up
+later, when something tries to read the missing object.
 
-It is relevant to [gitgitgadget/git#2219](https://github.com/gitgitgadget/git/pull/2219).
-It uses **only generated, two-commit repositories**, not files or objects from
-any real incident. It requires Python 3.10+ and Git (Git for Windows includes the
-shell needed by the timing wrapper). No Python packages are required.
+This reproduces it on demand, with synthetic repositories, in about two seconds.
+Related to [gitgitgadget/git#2219](https://github.com/gitgitgadget/git/pull/2219).
 
-## Run
+## What goes wrong
+
+Start with a repository holding two packs and a clean `git fsck`:
+
+```
+pack P  →  parent commit (+ its tree and blob)
+pack Q  →  tip commit    (+ its tree and blob)
+```
+
+A `.keep` file next to a pack means *"leave this pack alone, someone is using it"*.
+Neither pack has one yet. Now run `git repack --geometric=2 -d`:
+
+| Step | What happens |
+| --- | --- |
+| 1 | **repack scans the packs.** Neither P nor Q has a `.keep`, so it plans to combine both into one new pack and then delete both. |
+| 2 | **A fetch finishes right now.** `index-pack --keep` writes the pack it received — a duplicate of P, so the same objects and the same pack name — and creates `P.keep`. |
+| 3 | **repack starts its `pack-objects` child, which scans the packs again.** This time `P.keep` exists, so `--honor-pack-keep` skips every object in P. The new pack gets only the tip commit. |
+| 4 | **repack deletes P and Q**, carrying out the plan it made in step 1. Nothing rechecks the `.keep` that appeared in between. |
+| 5 | **The parent commit, tree and blob are gone.** `repack` exits `0`. `git fsck` now reports a broken link to a missing commit. |
+
+The bug is that steps 1 and 3 use **two different snapshots of the `.keep` files**.
+Step 3 excludes objects on the assumption that P will survive; step 1 already
+decided that P will not.
+
+Nothing here is exotic: a fetch and an automatic repack overlapping is ordinary
+behaviour on a busy repository, and Git offers no guarantee that a fetch's `.keep`
+cleanup happens before a concurrent repack looks.
+
+## Run it
 
 ```console
 python repro.py
 ```
 
-The default is three repetitions of all nine cases below. Everything is written
-to a **new** `artifacts` directory. The script refuses an existing output
-directory; it never opens your working repository for modification and never
-cleans up an existing directory. Use a different path to rerun:
+Needs Python 3.10+ and Git; no packages to install. On Windows, Git for Windows
+supplies the shell used by the timing wrapper.
 
-```console
-python repro.py --output artifacts/second-run --repeat 3
+Everything lands in a **new** `artifacts` directory — the script refuses to reuse
+an existing one, never touches your own repositories, and ignores your global and
+system Git configuration. Output looks like this:
+
+```
+01-geometric-control:     fsck 0 -> 0; repack exit 0; missing []; PASS
+01-geometric-race:        fsck 0 -> 2; repack exit 0; missing ['parent_blob', 'parent_tree', 'parent_commit']; PASS
+01-geometric-workaround:  fsck 0 -> 0; repack exit 0; missing []; PASS
 ```
 
-To test another Git executable or a patched build:
+`PASS` means *the observed outcome matched the expectation*. On the race line it
+confirms the bug happened — it does not mean Git is fine.
+
+Useful options:
 
 ```console
-python repro.py --git /path/to/git --output artifacts/patched --expect fixed
+python repro.py --output artifacts/second-run   # rerun without deleting evidence
+python repro.py --git /path/to/git --expect fixed   # check a patched build
 ```
 
-The harness ignores inherited `GIT_*` variables and system/global Git
-configuration in its synthetic repositories. This does not change your settings.
-Repositories and logs are retained for inspection.
+## What is checked
 
-## Expected results
-
-Each variant runs a healthy control, the race, and the race with the workaround:
+Three repack variants, each run as a healthy control, as the race, and as the
+race with the workaround, repeated three times (27 cases):
 
 | Variant | No race | Race | Race + `repack.packKeptObjects=true` |
 | --- | --- | --- | --- |
@@ -46,60 +78,66 @@ Each variant runs a healthy control, the race, and the race with the workaround:
 | Also `--write-midx` | Healthy | Objects lost | Healthy |
 | Also `repack.midxMustContainCruft=false` (follow mode) | Healthy | Objects lost | Healthy |
 
-The follow-mode case verifies that the child actually received
-`--stdin-packs=follow`. Every case checks initial `fsck`, final `fsck`, and direct
-object lookup **with MIDX lookup disabled**. The vulnerable case must lose the
-parent commit and tree and delete their original pack. A healthy result from the
-race case is a test failure under `--expect vulnerable`, not silently accepted.
+Every case checks `fsck` before, `fsck` after, and direct object lookup **with
+MIDX lookup disabled**, so a stale multi-pack index cannot disguise a present or
+absent object. The race case must lose the parent commit and tree *and* delete
+their original pack; a healthy result there is reported as a failure, not quietly
+accepted. The follow-mode case additionally verifies that the child really
+received `--stdin-packs=follow`.
 
-In the vulnerable case, **repack returns zero despite object loss**. It can also
-print an `info/refs` update error; this is not a claim of completely silent
-success. Both stdout and stderr are retained.
+In the race cases repack returns zero despite the loss. It may also print an
+`info/refs` update error, so this is not a claim of completely silent success.
+Both streams are kept in the evidence artifact.
 
-**Green CI means the bug was reproduced AND the controls/workaround passed.**
-It does not mean the pinned Git versions are safe. CI tests
-Git for Windows **2.55.0.windows.3** and upstream Git **2.55.0**, three times each.
-Read the job summary or download the evidence artifact for the outcome table,
-object IDs, subprocess arguments, and logs.
+## Is it fixed upstream?
 
-Both platforms reproduce the loss on clean GitHub-hosted runners, so this is not
-specific to Windows, to a filesystem, or to one machine's configuration.
+CI builds two Git trees from source and runs the same harness against both:
 
-## Why controlling timing is legitimate
+| Build | Expectation |
+| --- | --- |
+| `gitgitgadget/git` master, unpatched | must still lose objects |
+| `refs/pull/2219/head` (the proposed fix) | must preserve every object |
 
-1. Repack sees an existing pack P without a `.keep` and selects it for replacement.
-2. Before its `pack-objects` subprocess starts, the wrapper invokes **real Git
-   `index-pack --stdin --keep`**, receiving a duplicate of P.
-3. The wrapper verifies that Git created P's `.keep`, then runs the real,
-   unmodified packing subprocess.
-4. On vulnerable Git, `pack-objects --honor-pack-keep` skips P's objects, but the
-   parent repack still deletes P based on its earlier selection.
-5. Reachable objects are gone.
+This is what makes the badge meaningful: it fails if the bug stops reproducing on
+unpatched Git *or* if the proposed fix stops preventing it. The exact commits
+tested are printed in each run's job summary. Released builds are covered too —
+Git for Windows **2.55.0.windows.3** and upstream Git **2.55.0** — and both lose
+objects on clean GitHub-hosted runners, so this is not specific to Windows, to a
+filesystem, or to one machine's configuration.
 
-The wrapper forces a legal scheduling order instead of waiting for a random
-overlap. Leaving `.keep` present models the receiving parent not yet reaching its
-cleanup step. There is no enforced deadline requiring that cleanup to precede
-repacking. No object files are manually deleted during the race.
+## Workaround
 
-The fixture setup uses normal `pack-objects` and `prune-packed` to create two
-packs, then verifies a healthy repository **before** testing.
+Command-scoped `repack.packKeptObjects=true` prevents every failure reproduced
+here. It makes repacking include objects from kept packs rather than excluding
+them, which removes the inconsistency between the two scans. It can increase
+repacking work and storage use, and it cannot restore objects already lost.
 
-This is **not** a full network-fetch or VS Code autofetch test, a replay of a
-recorded historical process schedule, or a measurement of how frequently the
-race happens naturally. No claim is made that every real-world missing-object
-incident has this cause.
+## How the timing is forced
 
-## Workaround and upstream verification
+A wrapper named `git`, placed first in `GIT_EXEC_PATH`, intercepts the moment
+repack launches `pack-objects`. It then runs **real, unmodified Git**
+`index-pack --stdin --keep` on a duplicate of pack P, checks that Git created
+`P.keep`, and finally execs the real `pack-objects`. That is the whole trick; it
+is [21 lines](race-git.sh).
 
-Command-scoped `repack.packKeptObjects=true` prevents this reproduced failure.
-It makes repacking include objects in kept packs instead of independently
-excluding them. It can increase repacking work and storage use, and it cannot
-restore objects that were already lost.
+No pack, `.keep` file or object is ever created or deleted by hand, no Git source
+is modified, and the fixture is built with ordinary `pack-objects` and
+`prune-packed` and verified healthy before each test. The wrapper only forces a
+legal ordering instead of waiting for a coincidence, and leaving `.keep` in place
+models a fetch that has not yet reached its cleanup step.
 
-This repository tests the workaround, **not the upstream patch**. The
-`--expect fixed` mode is provided for maintainers to run against a patched build:
-all controls, races, and workaround cases must preserve every input object.
+## Scope and limits
 
-The implementation is in [repro.py](repro.py); the complete timing wrapper is
-[race-git.sh](race-git.sh). CI is in
-[reproduce.yml](.github/workflows/reproduce.yml).
+- This is a controlled interleaving, **not** an end-to-end network fetch test and
+  **not** a replay of any recorded incident.
+- It does not measure how often the race occurs naturally.
+- It makes no claim that any particular real-world missing-object report has this
+  cause.
+- The repositories are generated two-commit fixtures. No data from any real
+  repository is included.
+
+## Files
+
+- [repro.py](repro.py) — the harness
+- [race-git.sh](race-git.sh) — the timing wrapper
+- [.github/workflows/reproduce.yml](.github/workflows/reproduce.yml) — CI

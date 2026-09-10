@@ -1,17 +1,18 @@
-# Copyright (c) Microsoft Corporation. All rights reserved.
 name: Demonstrate object loss and workaround
 
 on:
   push:
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: '17 4 * * 1'
 
 permissions:
   contents: read
 
 jobs:
-  reproduce:
-    name: ${{ matrix.os }} / pinned vulnerable Git
+  released:
+    name: ${{ matrix.os }} / released Git
     strategy:
       fail-fast: false
       matrix:
@@ -73,4 +74,72 @@ jobs:
           path: |
             artifacts/results.json
             artifacts/summary.md
+            artifacts/**/*.log
+
+  candidate-fix:
+    name: gitgitgadget/git#2219 (unpatched master vs patched)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Fetch unpatched master and the proposed fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init -q "$RUNNER_TEMP/git-source"
+          cd "$RUNNER_TEMP/git-source"
+          git remote add origin https://github.com/gitgitgadget/git.git
+          git fetch -q --depth=1 origin refs/heads/master:refs/heads/unpatched
+          git fetch -q --depth=1 origin refs/pull/2219/head:refs/heads/patched
+          {
+            echo "Unpatched master: $(git rev-parse unpatched)"
+            echo "pull/2219/head:   $(git rev-parse patched)"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Build both trees
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/git-source"
+          for tree in unpatched patched; do
+            git checkout -q --detach "$tree"
+            make -j"$(nproc)" prefix="$RUNNER_TEMP/$tree" \
+              NO_GETTEXT=YesPlease NO_TCLTK=YesPlease NO_PERL=YesPlease \
+              NO_CURL=YesPlease NO_EXPAT=YesPlease \
+              all install >"$RUNNER_TEMP/build-$tree.log" 2>&1 || {
+                tail -50 "$RUNNER_TEMP/build-$tree.log"
+                exit 1
+              }
+            make clean >/dev/null 2>&1
+          done
+
+      - name: Unpatched master must still lose objects
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/unpatched/bin/git" --version
+          python repro.py --git "$RUNNER_TEMP/unpatched/bin/git" \
+            --output artifacts/unpatched --repeat 3 --expect vulnerable
+
+      - name: The proposed fix must preserve every object
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/patched/bin/git" --version
+          python repro.py --git "$RUNNER_TEMP/patched/bin/git" \
+            --output artifacts/patched --repeat 3 --expect fixed
+
+      - name: Upload evidence (no repository pack data)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-candidate-fix
+          if-no-files-found: warn
+          path: |
+            artifacts/**/results.json
+            artifacts/**/summary.md
             artifacts/**/*.log
